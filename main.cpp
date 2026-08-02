@@ -37,7 +37,7 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 namespace matrix = sycl::ext::oneapi::experimental::matrix;
-constexpr const char *tool_version = "1.0.0";
+constexpr const char *tool_version = "1.1.0";
 
 std::string concise_error(const std::exception &error) {
    const auto *sycl_error = dynamic_cast<const sycl::exception *>(&error);
@@ -878,12 +878,22 @@ TransferRates transfer_bandwidth(sycl::queue &q, const sycl::device &device,
 
 enum class StressProfile { compute, vram, mixed };
 
+enum class StressComputeWorkload {
+   fp32,
+   fp64,
+   matrix_fp16,
+   matrix_tf32,
+   matrix_int8,
+   matrix_fp64
+};
+
 constexpr std::size_t default_stress_chunk_bytes = 512ull << 20;
 
 struct StressOptions {
    std::chrono::seconds duration{60};
    std::chrono::seconds report_interval{5};
    StressProfile profile = StressProfile::mixed;
+   StressComputeWorkload compute_workload = StressComputeWorkload::fp32;
    unsigned memory_percent = 50;
    std::size_t chunk_size_bytes = default_stress_chunk_bytes;
    std::uint32_t seed = 0x6d2b79f5u;
@@ -907,6 +917,29 @@ const char *stress_profile_name(StressProfile profile) {
       return "mixed";
    }
    return "unknown";
+}
+
+const char *stress_compute_workload_name(StressComputeWorkload workload) {
+   switch (workload) {
+   case StressComputeWorkload::fp32:
+      return "fp32";
+   case StressComputeWorkload::fp64:
+      return "fp64";
+   case StressComputeWorkload::matrix_fp16:
+      return "matrix-fp16";
+   case StressComputeWorkload::matrix_tf32:
+      return "matrix-tf32";
+   case StressComputeWorkload::matrix_int8:
+      return "matrix-int8";
+   case StressComputeWorkload::matrix_fp64:
+      return "matrix-fp64";
+   }
+   return "unknown";
+}
+
+const char *stress_compute_unit(StressComputeWorkload workload) {
+   return workload == StressComputeWorkload::matrix_int8 ? "TIOP/s"
+                                                         : "TFLOP/s";
 }
 
 class AsyncErrorState {
@@ -957,16 +990,25 @@ double completed_event_ms(sycl::event &event, bool profiling,
       Clock::now() - host_begin).count();
 }
 
-class StressCompute {
+class StressComputeRunner {
 public:
-   StressCompute(sycl::queue &q, const sycl::device &device, bool profiling)
+   virtual ~StressComputeRunner() = default;
+   virtual double run() = 0;
+   virtual std::uint32_t verify() = 0;
+};
+
+template <typename T>
+class StressScalarCompute final : public StressComputeRunner {
+public:
+   StressScalarCompute(
+      sycl::queue &q, const sycl::device &device, bool profiling)
       : q_(q), profiling_(profiling),
         items_(std::min<std::size_t>(256,
                   device.get_info<sycl::info::device::max_work_group_size>()) *
            std::max<std::size_t>(256,
               8 * device.get_info<sycl::info::device::max_compute_units>())),
         input_(q, items_), output_(q, items_), errors_(q, 1) {
-      q_.fill(input_.get(), 1.0f, items_).wait_and_throw();
+      q_.fill(input_.get(), T{1}, items_).wait_and_throw();
 
       for (int attempt = 0; attempt < 5; ++attempt) {
          const auto begin = Clock::now();
@@ -983,7 +1025,7 @@ public:
       expected_ = reference_result(iterations_);
    }
 
-   double run() {
+   double run() override {
       const auto begin = Clock::now();
       auto event = launch(iterations_);
       const double ms = completed_event_ms(event, profiling_, begin);
@@ -992,15 +1034,15 @@ public:
       return operations / (ms * 1.0e9);
    }
 
-   std::uint32_t verify() {
+   std::uint32_t verify() override {
       q_.fill(errors_.get(), 0u, 1).wait_and_throw();
-      const float expected = expected_;
-      const float tolerance =
-         std::max(1.0e-3f, std::abs(expected) * 1.0e-4f);
-      const float *out = output_.get();
+      const T expected = expected_;
+      const T tolerance =
+         std::max(T{1.0e-3}, sycl::fabs(expected) * T{1.0e-4});
+      const T *out = output_.get();
       std::uint32_t *error_count = errors_.get();
       q_.parallel_for(sycl::range<1>(items_), [=](sycl::id<1> id) {
-         const float value = out[id];
+         const T value = out[id];
          if (!sycl::isfinite(value) ||
              sycl::fabs(value - expected) > tolerance) {
             sycl::atomic_ref<std::uint32_t,
@@ -1018,22 +1060,22 @@ private:
    static constexpr std::size_t accumulators = 16;
 
    sycl::event launch(std::size_t iterations) {
-      const float *in = input_.get();
-      float *out = output_.get();
+      const T *in = input_.get();
+      T *out = output_.get();
       return q_.parallel_for(sycl::range<1>(items_), [=](sycl::id<1> id) {
-         const float x = in[id];
-         float acc[accumulators];
+         const T x = in[id];
+         T acc[accumulators];
 #pragma unroll
          for (std::size_t lane = 0; lane < accumulators; ++lane) {
-            acc[lane] = x + static_cast<float>(lane + 1);
+            acc[lane] = x + static_cast<T>(lane + 1);
          }
          for (std::size_t i = 0; i < iterations; ++i) {
 #pragma unroll
             for (std::size_t lane = 0; lane < accumulators; ++lane) {
-               acc[lane] = sycl::fma(acc[lane], 0.999f, 0.001f);
+               acc[lane] = sycl::fma(acc[lane], T{0.999}, T{0.001});
             }
          }
-         float sum = 0.0f;
+         T sum{};
 #pragma unroll
          for (std::size_t lane = 0; lane < accumulators; ++lane) {
             sum += acc[lane];
@@ -1042,18 +1084,18 @@ private:
       });
    }
 
-   static float reference_result(std::size_t iterations) {
-      float acc[accumulators];
+   static T reference_result(std::size_t iterations) {
+      T acc[accumulators];
       for (std::size_t lane = 0; lane < accumulators; ++lane) {
-         acc[lane] = 1.0f + static_cast<float>(lane + 1);
+         acc[lane] = T{1} + static_cast<T>(lane + 1);
       }
       for (std::size_t i = 0; i < iterations; ++i) {
-         for (float &value : acc) {
-            value = std::fma(value, 0.999f, 0.001f);
+         for (T &value : acc) {
+            value = std::fma(value, T{0.999}, T{0.001});
          }
       }
-      float sum = 0.0f;
-      for (const float value : acc) {
+      T sum{};
+      for (const T value : acc) {
          sum += value;
       }
       return sum;
@@ -1063,11 +1105,226 @@ private:
    bool profiling_;
    std::size_t items_;
    std::size_t iterations_ = 256;
-   float expected_ = 0.0f;
-   UsmBuffer<float> input_;
-   UsmBuffer<float> output_;
+   T expected_{};
+   UsmBuffer<T> input_;
+   UsmBuffer<T> output_;
    UsmBuffer<std::uint32_t> errors_;
 };
+
+template <typename Case> class StressMatrixKernel;
+
+template <typename Case>
+class StressMatrixCompute final : public StressComputeRunner {
+public:
+   using Storage = typename Case::storage_type;
+   using Element = typename Case::element_type;
+   using Acc = typename Case::acc_type;
+
+   StressMatrixCompute(
+      sycl::queue &q, const sycl::device &device, bool profiling)
+      : q_(q), profiling_(profiling),
+        groups_(std::max<std::size_t>(256,
+           16 * device.get_info<sycl::info::device::max_compute_units>())),
+        input_(matrix_input()), a_(q, Case::m * Case::k),
+        b_(q, Case::k * Case::n),
+        output_(q, groups_ * accumulators * Case::m * Case::n),
+        errors_(q, 1) {
+      q_.fill(a_.get(), input_, Case::m * Case::k);
+      q_.fill(b_.get(), input_, Case::k * Case::n);
+      q_.fill(output_.get(), Acc{}, output_count()).wait_and_throw();
+
+      for (int attempt = 0; attempt < 5; ++attempt) {
+         const auto begin = Clock::now();
+         auto event = launch(iterations_);
+         const double ms = completed_event_ms(event, profiling_, begin);
+         if (ms >= 40.0 || iterations_ == (1u << 20)) {
+            break;
+         }
+         const auto scale = static_cast<std::size_t>(
+            std::clamp(80.0 / std::max(ms, 0.05), 2.0, 32.0));
+         iterations_ =
+            std::min<std::size_t>(1u << 20, iterations_ * scale);
+      }
+   }
+
+   double run() override {
+      const auto begin = Clock::now();
+      auto event = launch(iterations_);
+      const double ms = completed_event_ms(event, profiling_, begin);
+      const double operations = static_cast<double>(groups_) * iterations_ *
+         accumulators * 2 * Case::m * Case::n * Case::k;
+      return operations / (ms * 1.0e9);
+   }
+
+   std::uint32_t verify() override {
+      q_.fill(errors_.get(), 0u, 1).wait_and_throw();
+      const Acc *out = output_.get();
+      std::uint32_t *error_count = errors_.get();
+      const Storage input = input_;
+      const std::size_t iterations = iterations_;
+      constexpr std::size_t matrix_elements = Case::m * Case::n;
+      q_.parallel_for(sycl::range<1>(output_count()), [=](sycl::id<1> id) {
+         const std::size_t accumulator =
+            (id[0] / matrix_elements) % accumulators;
+         const Acc expected = static_cast<Acc>(accumulator) +
+            static_cast<Acc>(iterations * Case::k) *
+               static_cast<Acc>(input) * static_cast<Acc>(input);
+         const Acc value = out[id];
+         bool incorrect;
+         if constexpr (std::is_integral_v<Acc>) {
+            incorrect = value != expected;
+         } else {
+            const Acc tolerance =
+               std::max(Acc{1.0e-4}, sycl::fabs(expected) * Acc{1.0e-5});
+            incorrect = !sycl::isfinite(value) ||
+               sycl::fabs(value - expected) > tolerance;
+         }
+         if (incorrect) {
+            sycl::atomic_ref<std::uint32_t,
+               sycl::memory_order::relaxed, sycl::memory_scope::device,
+               sycl::access::address_space::global_space>(*error_count)
+               .fetch_add(1);
+         }
+      }).wait_and_throw();
+      std::uint32_t result = 0;
+      q_.memcpy(&result, errors_.get(), sizeof(result)).wait_and_throw();
+      return result;
+   }
+
+private:
+   static constexpr std::size_t subgroup = 32;
+   static constexpr std::size_t accumulators = 4;
+
+   static Storage matrix_input() {
+      if constexpr (std::is_integral_v<Storage>) {
+         return Storage{1};
+      } else {
+         return Storage{0.03125};
+      }
+   }
+
+   std::size_t output_count() const {
+      return groups_ * accumulators * Case::m * Case::n;
+   }
+
+   sycl::event launch(std::size_t iterations) {
+      const Storage *pa_raw = a_.get();
+      const Storage *pb_raw = b_.get();
+      Acc *out_raw = output_.get();
+      return q_.parallel_for<StressMatrixKernel<Case>>(
+         sycl::nd_range<1>(groups_ * subgroup, subgroup),
+         [=](sycl::nd_item<1> item)
+#if !defined(__SYCL_DEVICE_ONLY__) || !defined(__AMDGCN__)
+            [[sycl::reqd_sub_group_size(32)]]
+#endif
+         {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+            if constexpr (!amd_matrix_case_supported_in_image<Case>) {
+               (void)item;
+               (void)iterations;
+               (void)pa_raw;
+               (void)pb_raw;
+               (void)out_raw;
+            } else
+#endif
+            {
+               const auto sg = item.get_sub_group();
+               auto pa = sycl::address_space_cast<
+                  sycl::access::address_space::global_space,
+                  sycl::access::decorated::no>(pa_raw);
+               auto pb = sycl::address_space_cast<
+                  sycl::access::address_space::global_space,
+                  sycl::access::decorated::no>(pb_raw);
+               auto pc = sycl::address_space_cast<
+                  sycl::access::address_space::global_space,
+                  sycl::access::decorated::no>(out_raw);
+               matrix::joint_matrix<sycl::sub_group, Element, matrix::use::a,
+                  Case::m, Case::k, matrix::layout::row_major> ma;
+               matrix::joint_matrix<sycl::sub_group, Element, matrix::use::b,
+                  Case::k, Case::n, matrix::layout::row_major> mb;
+               matrix::joint_matrix<sycl::sub_group, Acc,
+                  matrix::use::accumulator, Case::m, Case::n> mc[accumulators];
+               matrix::joint_matrix_load(sg, ma, pa, Case::k);
+               matrix::joint_matrix_load(sg, mb, pb, Case::n);
+               for (std::size_t i = 0; i < accumulators; ++i) {
+                  matrix::joint_matrix_fill(sg, mc[i], static_cast<Acc>(i));
+               }
+               for (std::size_t r = 0; r < iterations; ++r) {
+                  for (std::size_t i = 0; i < accumulators; ++i) {
+                     matrix::joint_matrix_mad(sg, mc[i], ma, mb, mc[i]);
+                  }
+               }
+               const std::size_t base = item.get_group_linear_id() *
+                  accumulators * Case::m * Case::n;
+               for (std::size_t i = 0; i < accumulators; ++i) {
+                  matrix::joint_matrix_store(sg, mc[i],
+                     pc + base + i * Case::m * Case::n, Case::n,
+                     matrix::layout::row_major);
+               }
+            }
+         });
+   }
+
+   sycl::queue &q_;
+   bool profiling_;
+   std::size_t groups_;
+   std::size_t iterations_ = 128;
+   Storage input_;
+   UsmBuffer<Storage> a_;
+   UsmBuffer<Storage> b_;
+   UsmBuffer<Acc> output_;
+   UsmBuffer<std::uint32_t> errors_;
+};
+
+template <typename Case>
+std::unique_ptr<StressComputeRunner> make_stress_matrix_compute(
+   sycl::queue &q, const sycl::device &device, bool profiling,
+   StressComputeWorkload workload) {
+   if (!supports_matrix_gemm<Case>(device)) {
+      throw std::runtime_error(std::string("compute workload ") +
+         stress_compute_workload_name(workload) +
+         " is not supported by device");
+   }
+   auto result =
+      std::make_unique<StressMatrixCompute<Case>>(q, device, profiling);
+   const std::uint32_t errors = result->verify();
+   if (errors != 0) {
+      throw std::runtime_error(std::string("compute workload ") +
+         stress_compute_workload_name(workload) +
+         " failed initial verification; device image may not support it");
+   }
+   return result;
+}
+
+std::unique_ptr<StressComputeRunner> make_stress_compute(
+   sycl::queue &q, const sycl::device &device, bool profiling,
+   StressComputeWorkload workload) {
+   switch (workload) {
+   case StressComputeWorkload::fp32:
+      return std::make_unique<StressScalarCompute<float>>(
+         q, device, profiling);
+   case StressComputeWorkload::fp64:
+      if (!device.has(sycl::aspect::fp64)) {
+         throw std::runtime_error(
+            "compute workload fp64 is not supported by device");
+      }
+      return std::make_unique<StressScalarCompute<double>>(
+         q, device, profiling);
+   case StressComputeWorkload::matrix_fp16:
+      return make_stress_matrix_compute<Fp16Case>(
+         q, device, profiling, workload);
+   case StressComputeWorkload::matrix_tf32:
+      return make_stress_matrix_compute<Tf32Case>(
+         q, device, profiling, workload);
+   case StressComputeWorkload::matrix_int8:
+      return make_stress_matrix_compute<Int8Case>(
+         q, device, profiling, workload);
+   case StressComputeWorkload::matrix_fp64:
+      return make_stress_matrix_compute<Fp64Case>(
+         q, device, profiling, workload);
+   }
+   throw std::runtime_error("unknown stress compute workload");
+}
 
 std::uint32_t stress_pattern(std::size_t index, std::uint32_t seed) {
    const std::uint64_t wide = static_cast<std::uint64_t>(index);
@@ -1315,6 +1572,8 @@ struct StressSummary {
    DeviceEntry entry;
    std::string timestamp;
    std::string profile;
+   std::string compute_workload;
+   std::string compute_unit;
    std::uint64_t requested_seconds = 0;
    unsigned memory_percent = 0;
    std::uint32_t seed = 0;
@@ -1335,6 +1594,9 @@ StressSummary make_stress_summary(const DeviceEntry &entry,
    StressSummary summary{entry};
    summary.timestamp = utc_timestamp();
    summary.profile = stress_profile_name(options.profile);
+   summary.compute_workload =
+      stress_compute_workload_name(options.compute_workload);
+   summary.compute_unit = stress_compute_unit(options.compute_workload);
    summary.requested_seconds = options.duration.count();
    summary.memory_percent = options.memory_percent;
    summary.seed = options.seed;
@@ -1373,10 +1635,11 @@ StressSummary stress_device(const DeviceEntry &entry,
       profiling ? properties
                 : sycl::property_list{sycl::property::queue::in_order{}});
 
-   std::unique_ptr<StressCompute> compute;
+   std::unique_ptr<StressComputeRunner> compute;
    std::unique_ptr<StressVram> vram;
    if (options.profile != StressProfile::vram) {
-      compute = std::make_unique<StressCompute>(q, device, profiling);
+      compute = make_stress_compute(
+         q, device, profiling, options.compute_workload);
    }
    if (options.profile != StressProfile::compute) {
       vram = std::make_unique<StressVram>(
@@ -1658,6 +1921,31 @@ StressProfile parse_stress_profile(const std::string &value) {
    }
    throw std::invalid_argument("invalid stress profile: " + value +
       " (expected compute, vram, or mixed)");
+}
+
+StressComputeWorkload parse_stress_compute_workload(
+   const std::string &value) {
+   if (value == "fp32") {
+      return StressComputeWorkload::fp32;
+   }
+   if (value == "fp64") {
+      return StressComputeWorkload::fp64;
+   }
+   if (value == "matrix-fp16") {
+      return StressComputeWorkload::matrix_fp16;
+   }
+   if (value == "matrix-tf32") {
+      return StressComputeWorkload::matrix_tf32;
+   }
+   if (value == "matrix-int8") {
+      return StressComputeWorkload::matrix_int8;
+   }
+   if (value == "matrix-fp64") {
+      return StressComputeWorkload::matrix_fp64;
+   }
+   throw std::invalid_argument("invalid compute workload: " + value +
+      "; expected fp32, fp64, matrix-fp16, matrix-tf32, matrix-int8, "
+      "or matrix-fp64");
 }
 
 unsigned parse_memory_percent(std::string value) {
@@ -2256,11 +2544,13 @@ void write_rate_summary_json(std::ostream &out,
 
 void write_stress_summary_json(std::ostream &out,
    const StressSummary &summary) {
-   out << "{\"schema_version\":1,\"tool_version\":\""
+   out << "{\"schema_version\":2,\"tool_version\":\""
        << tool_version << "\",\"timestamp\":\""
        << json_escape(summary.timestamp) << "\",\"device\":";
    write_device_json(out, summary.entry);
    out << ",\"profile\":\"" << summary.profile
+       << "\",\"compute_workload\":\"" << summary.compute_workload
+       << "\",\"compute_unit\":\"" << summary.compute_unit
        << "\",\"requested_seconds\":" << summary.requested_seconds
        << ",\"memory_percent\":" << summary.memory_percent
        << ",\"seed\":" << summary.seed
@@ -2273,7 +2563,7 @@ void write_stress_summary_json(std::ostream &out,
        << ",\"compute_slowdown_percent\":"
        << summary.compute_slowdown << ",\"vram_slowdown_percent\":"
        << summary.vram_slowdown << ",\"compute\":";
-   write_rate_summary_json(out, summary.compute, "TFLOP/s");
+   write_rate_summary_json(out, summary.compute, summary.compute_unit.c_str());
    out << ",\"vram\":";
    write_rate_summary_json(out, summary.vram, "GB/s");
    if (!summary.message.empty()) {
@@ -2287,7 +2577,10 @@ public:
    StressRenderer(OutputFormat format, std::ostream &out,
       const StressOptions &options,
       const std::vector<DeviceEntry> &devices)
-      : format_(format), out_(out) {
+      : format_(format), out_(out),
+        compute_workload_(stress_compute_workload_name(
+           options.compute_workload)),
+        compute_unit_(stress_compute_unit(options.compute_workload)) {
       if (format_ == OutputFormat::text) {
          out_ << "SYCL stress plan\n"
               << "  profile          : "
@@ -2296,6 +2589,9 @@ public:
               << " seconds\n"
               << "  report.interval  : "
               << options.report_interval.count() << " seconds\n";
+         if (options.profile != StressProfile::vram) {
+            out_ << "  compute.workload : " << compute_workload_ << '\n';
+         }
          if (options.profile != StressProfile::compute) {
             out_ << "  memory.request   : " << options.memory_percent
                  << "%\n"
@@ -2313,9 +2609,10 @@ public:
          }
          out_ << std::flush;
       } else if (format_ == OutputFormat::csv) {
-         out_ << "timestamp,event,selector,elapsed_seconds,status,memory_bytes,"
+         out_ << "timestamp,event,selector,elapsed_seconds,status,"
+                 "compute_workload,compute_unit,memory_bytes,"
                  "memory_chunks,memory_max_chunk_bytes,compute_samples,"
-                 "compute_average_tflops,compute_minimum_tflops,"
+                 "compute_average,compute_minimum,"
                  "compute_slowdown_percent,vram_samples,vram_average_gbps,"
                  "vram_minimum_gbps,vram_slowdown_percent,message\n";
       }
@@ -2335,7 +2632,7 @@ public:
               << ']';
          if (interval.compute_batches != 0) {
             out_ << " compute=" << std::fixed << std::setprecision(3)
-                 << compute_average << " TFLOP/s (min "
+                 << compute_average << ' ' << compute_unit_ << " (min "
                  << interval.compute_min << ')';
          }
          if (interval.vram_passes != 0) {
@@ -2345,14 +2642,16 @@ public:
          }
          out_ << " errors=0\n" << std::flush;
       } else if (format_ == OutputFormat::jsonl) {
-         out_ << "{\"schema_version\":1,\"tool_version\":\""
+         out_ << "{\"schema_version\":2,\"tool_version\":\""
               << tool_version << "\",\"timestamp\":\""
               << utc_timestamp()
               << "\",\"event\":\"interval\",\"selector\":\""
               << json_escape(entry.selector) << "\",\"elapsed_seconds\":"
-              << seconds << ",\"compute_samples\":"
-              << interval.compute_batches << ",\"compute_average_tflops\":"
-              << compute_average << ",\"compute_minimum_tflops\":"
+              << seconds << ",\"compute_workload\":\""
+              << compute_workload_ << "\",\"compute_unit\":\""
+              << compute_unit_ << "\",\"compute_samples\":"
+              << interval.compute_batches << ",\"compute_average\":"
+              << compute_average << ",\"compute_minimum\":"
               << (interval.compute_batches ? interval.compute_min : 0.0)
               << ",\"vram_samples\":" << interval.vram_passes
               << ",\"vram_average_gbps\":" << vram_average
@@ -2362,7 +2661,8 @@ public:
       } else if (format_ == OutputFormat::csv) {
          out_ << csv_escape(utc_timestamp()) << ",interval,"
               << csv_escape(entry.selector) << ','
-              << seconds << ",running,0,0,0," << interval.compute_batches
+              << seconds << ",running," << compute_workload_ << ','
+              << compute_unit_ << ",0,0,0," << interval.compute_batches
               << ','
               << compute_average << ','
               << (interval.compute_batches ? interval.compute_min : 0.0)
@@ -2403,9 +2703,10 @@ public:
                     << " MiB each)\n";
             }
             if (summary.compute.samples) {
-               out_ << "  compute          : avg " << summary.compute.average
+               out_ << "  compute          : " << summary.compute_workload
+                    << ", avg " << summary.compute.average
                     << ", min " << summary.compute.minimum << ", p95 "
-                    << summary.compute.p95 << " TFLOP/s ("
+                    << summary.compute.p95 << ' ' << summary.compute_unit << " ("
                     << summary.compute.samples << " batches)\n"
                     << "  compute.slowdown : " << summary.compute_slowdown
                     << "%\n";
@@ -2429,6 +2730,8 @@ public:
             out_ << csv_escape(summary.timestamp) << ",summary,"
                  << csv_escape(summary.entry.selector) << ','
                  << summary.elapsed_seconds << ',' << summary.status << ','
+                 << summary.compute_workload << ',' << summary.compute_unit
+                 << ','
                  << summary.memory_bytes << ',' << summary.memory_chunks << ','
                  << summary.memory_max_chunk_bytes << ','
                  << summary.compute.samples << ',' << summary.compute.average
@@ -2445,6 +2748,8 @@ public:
 private:
    OutputFormat format_;
    std::ostream &out_;
+   std::string compute_workload_;
+   std::string compute_unit_;
    std::mutex mutex_;
 };
 
@@ -2527,12 +2832,14 @@ void show_stress_help(const char *program) {
       << "  --device SELECTOR      global ID, backend:index, or unique name text\n"
       << "  --all-gpus             select every visible GPU\n"
       << "  --profile PROFILE      compute, vram, or mixed (default: mixed)\n"
+      << "  --compute-workload W   fp32, fp64, matrix-fp16, matrix-tf32,\n"
+      << "                         matrix-int8, or matrix-fp64 (default: fp32)\n"
       << "  --memory PERCENT       device memory to validate, 1-90 (default: 50)\n"
       << "  --chunk-size SIZE      maximum allocation chunk in MiB or GiB\n"
       << "                         (default: 512MiB; bare numbers mean MiB)\n"
       << "  --report-interval TIME progress interval (default: 5s)\n"
       << "  --seed VALUE           decimal or 0x-prefixed pattern seed\n"
-      << "  --min-compute-rate N   fail below N TFLOP/s average\n"
+      << "  --min-compute-rate N   fail below selected workload's average rate\n"
       << "  --min-vram-rate N      fail below N GB/s average\n"
       << "  --max-slowdown N       fail above N percent interval slowdown\n"
       << "  --parallel             run selected devices together (default)\n"
@@ -2609,6 +2916,7 @@ int run_stress_command(int argc, char **argv,
    SelectionOptions selection;
    OutputOptions output;
    bool duration_seen = false;
+   bool compute_workload_seen = false;
    for (int i = 2; i < argc; ++i) {
       const std::string arg(argv[i]);
       const auto require_value = [&](const char *option) -> std::string {
@@ -2632,6 +2940,10 @@ int run_stress_command(int argc, char **argv,
          duration_seen = true;
       } else if (arg == "--profile") {
          options.profile = parse_stress_profile(require_value("--profile"));
+      } else if (arg == "--compute-workload") {
+         options.compute_workload = parse_stress_compute_workload(
+            require_value("--compute-workload"));
+         compute_workload_seen = true;
       } else if (arg == "--memory") {
          options.memory_percent =
             parse_memory_percent(require_value("--memory"));
@@ -2662,6 +2974,10 @@ int run_stress_command(int argc, char **argv,
    }
    if (!duration_seen) {
       throw std::invalid_argument("stress requires --duration TIME");
+   }
+   if (options.profile == StressProfile::vram && compute_workload_seen) {
+      throw std::invalid_argument(
+         "--compute-workload requires compute or mixed profile");
    }
    if (options.profile == StressProfile::vram &&
        options.minimum_compute_rate >= 0.0) {

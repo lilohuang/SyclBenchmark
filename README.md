@@ -36,6 +36,7 @@ The benchmark command measures:
 The stress command provides:
 
 - `compute`, `vram`, and `mixed` profiles
+- Selectable FP32, FP64, FP16/TF32/INT8/FP64 joint-matrix compute workloads
 - Full compute-output validation after every batch
 - Full working-set validation after each address-dependent VRAM pattern write
 - Bounded durations, reproducible seeds, and graceful Ctrl-C handling
@@ -169,6 +170,10 @@ A duration and explicit device selection are required:
 ```sh
 ./sycl-bench stress --device hip:0 --duration 30m
 ./sycl-bench stress --device cuda:0 --duration 1h --profile compute
+./sycl-bench stress --device cuda:0 --duration 1h --profile compute \
+  --compute-workload fp64
+./sycl-bench stress --device level_zero:0 --duration 30m --profile compute \
+  --compute-workload matrix-fp16
 ./sycl-bench stress --device hip:0 --duration 8h \
   --profile vram --memory 80
 ```
@@ -179,6 +184,14 @@ Durations accept `s`, `m`, and `h`. The defaults are:
 profile=mixed  memory=50%  chunk-size=512MiB  report-interval=5s
 seed=0x6d2b79f5  execution=parallel
 ```
+
+The default compute workload is `fp32`. `--compute-workload` also accepts
+`fp64`, `matrix-fp16`, `matrix-tf32`, `matrix-int8`, and `matrix-fp64` for the
+`compute` and `mixed` profiles. A requested FP64 or joint-matrix workload is
+never replaced with FP32: if the selected device does not advertise the
+required FP64 aspect, 32-lane subgroup, or matching `matrix_combinations`
+entry, that device reports `error` and the command exits with status 1. Matrix
+workloads perform a full output verification after every timed batch.
 
 Multiple selected devices run concurrently for the requested wall-clock
 duration:
