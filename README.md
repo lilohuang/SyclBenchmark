@@ -163,6 +163,16 @@ counted as two operations. Unsupported tests are reported as `unavailable`.
 Matrix output contains complete GEMM throughput and an `.issue` measurement.
 The latter is an instruction issue-rate ceiling, not complete GEMM throughput.
 
+All matrix tests measure dense MMA throughput through the ordinary
+`joint_matrix_mad` path. Compare a reported rate only with a dense MMA peak
+that uses the same input and accumulator types.
+
+These tests do not issue sparse MMA instructions, encode structured-sparsity
+metadata, or compress sparse operands. A theoretical peak that assumes
+sparsity or reports an effective sparse rate is therefore not directly
+comparable and is not an expected result. Zero-valued matrix elements are
+still processed and counted as part of a dense operation.
+
 ## Stress test
 
 A duration and explicit device selection are required:
@@ -191,7 +201,8 @@ The default compute workload is `fp32`. `--compute-workload` also accepts
 never replaced with FP32: if the selected device does not advertise the
 required FP64 aspect, 32-lane subgroup, or matching `matrix_combinations`
 entry, that device reports `error` and the command exits with status 1. Matrix
-workloads perform a full output verification after every timed batch.
+workloads use the same dense matrix path described above and perform a full
+output verification after every timed batch.
 
 Multiple selected devices run concurrently for the requested wall-clock
 duration:
