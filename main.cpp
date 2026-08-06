@@ -340,9 +340,19 @@ struct MatrixRate {
    double tops;
 };
 
+enum MatrixImage : unsigned {
+   matrix_image_spirv = 1u << 0,
+   matrix_image_cuda_sm70 = 1u << 1,
+   matrix_image_cuda_sm72 = 1u << 2,
+   matrix_image_cuda_sm80 = 1u << 3,
+   matrix_image_amd_gfx11 = 1u << 4,
+   matrix_image_amd_gfx90a = 1u << 5
+};
+
 template <typename Storage_, typename Element_, typename Acc_,
-   std::size_t M_, std::size_t N_, std::size_t K_,
-   matrix::matrix_type InputType_, matrix::matrix_type AccType_>
+   std::size_t M_, std::size_t N_, std::size_t K_, std::size_t Subgroup_,
+   unsigned Images_, matrix::matrix_type InputType_,
+   matrix::matrix_type AccType_>
 struct MatrixCase {
    using storage_type = Storage_;
    using element_type = Element_;
@@ -350,33 +360,113 @@ struct MatrixCase {
    static constexpr std::size_t m = M_;
    static constexpr std::size_t n = N_;
    static constexpr std::size_t k = K_;
+   static constexpr std::size_t subgroup = Subgroup_;
+   static constexpr unsigned images = Images_;
    static constexpr std::size_t rows = 4;
    static constexpr std::size_t cols = 4;
    static constexpr matrix::matrix_type input_type = InputType_;
    static constexpr matrix::matrix_type acc_matrix_type = AccType_;
 };
 
-using Fp16Case = MatrixCase<sycl::half, sycl::half, float, 16, 16, 16,
+constexpr unsigned cuda_fp16_images = matrix_image_cuda_sm70 |
+   matrix_image_cuda_sm72 | matrix_image_cuda_sm80;
+constexpr unsigned cuda_int8_images =
+   matrix_image_cuda_sm72 | matrix_image_cuda_sm80;
+
+using Fp16Case = MatrixCase<sycl::half, sycl::half, float, 16, 16, 16, 32,
+   cuda_fp16_images | matrix_image_amd_gfx11,
    matrix::matrix_type::fp16, matrix::matrix_type::fp32>;
+using Bf16Case = MatrixCase<sycl::ext::oneapi::bfloat16,
+   sycl::ext::oneapi::bfloat16, float, 16, 16, 16, 32,
+   matrix_image_cuda_sm80 | matrix_image_amd_gfx11,
+   matrix::matrix_type::bf16, matrix::matrix_type::fp32>;
 using Tf32Case = MatrixCase<float, matrix::precision::tf32, float, 16, 16, 8,
+   32, matrix_image_cuda_sm80,
    matrix::matrix_type::tf32, matrix::matrix_type::fp32>;
 using Int8Case = MatrixCase<std::int8_t, std::int8_t, std::int32_t, 16, 16,
-   16, matrix::matrix_type::sint8, matrix::matrix_type::sint32>;
-using Fp64Case = MatrixCase<double, double, double, 8, 8, 4,
+   16, 32, cuda_int8_images | matrix_image_amd_gfx11,
+   matrix::matrix_type::sint8, matrix::matrix_type::sint32>;
+using Fp64Case = MatrixCase<double, double, double, 8, 8, 4, 32,
+   matrix_image_cuda_sm80,
    matrix::matrix_type::fp64, matrix::matrix_type::fp64>;
 
-template <typename Case>
-inline constexpr bool amd_matrix_case_supported_in_image =
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__) &&                \
-   (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__))
-   Case::m == 16 && Case::n == 16 && Case::k == 16 &&
-   ((std::is_same_v<typename Case::element_type, sycl::half> &&
-       std::is_same_v<typename Case::acc_type, float>) ||
-      (std::is_same_v<typename Case::element_type, std::int8_t> &&
-         std::is_same_v<typename Case::acc_type, std::int32_t>));
+using Amd90aFp16Case = MatrixCase<sycl::half, sycl::half, float, 16, 16,
+   16, 64, matrix_image_amd_gfx90a,
+   matrix::matrix_type::fp16, matrix::matrix_type::fp32>;
+using Amd90aBf16Case = MatrixCase<sycl::ext::oneapi::bfloat16,
+   sycl::ext::oneapi::bfloat16, float, 16, 16, 16, 64,
+   matrix_image_amd_gfx90a,
+   matrix::matrix_type::bf16, matrix::matrix_type::fp32>;
+using Amd90aInt8Case = MatrixCase<std::int8_t, std::int8_t, std::int32_t,
+   16, 16, 16, 64, matrix_image_amd_gfx90a,
+   matrix::matrix_type::sint8, matrix::matrix_type::sint32>;
+using Amd90aFp64Case = MatrixCase<double, double, double, 16, 16, 4, 64,
+   matrix_image_amd_gfx90a,
+   matrix::matrix_type::fp64, matrix::matrix_type::fp64>;
+
+using SpirvFp16WideCase = MatrixCase<sycl::half, sycl::half, float, 8, 16,
+   16, 16, matrix_image_spirv,
+   matrix::matrix_type::fp16, matrix::matrix_type::fp32>;
+using SpirvBf16WideCase = MatrixCase<sycl::ext::oneapi::bfloat16,
+   sycl::ext::oneapi::bfloat16, float, 8, 16, 16, 16,
+   matrix_image_spirv,
+   matrix::matrix_type::bf16, matrix::matrix_type::fp32>;
+using SpirvTf32WideCase = MatrixCase<float, matrix::precision::tf32, float,
+   8, 16, 8, 16, matrix_image_spirv,
+   matrix::matrix_type::tf32, matrix::matrix_type::fp32>;
+using SpirvInt8WideCase = MatrixCase<std::int8_t, std::int8_t, std::int32_t,
+   8, 16, 32, 16, matrix_image_spirv,
+   matrix::matrix_type::sint8, matrix::matrix_type::sint32>;
+
+using SpirvFp16NarrowCase = MatrixCase<sycl::half, sycl::half, float, 8, 8,
+   16, 16, matrix_image_spirv,
+   matrix::matrix_type::fp16, matrix::matrix_type::fp32>;
+using SpirvBf16NarrowCase = MatrixCase<sycl::ext::oneapi::bfloat16,
+   sycl::ext::oneapi::bfloat16, float, 8, 8, 16, 16,
+   matrix_image_spirv,
+   matrix::matrix_type::bf16, matrix::matrix_type::fp32>;
+using SpirvInt8NarrowCase = MatrixCase<std::int8_t, std::int8_t, std::int32_t,
+   8, 8, 32, 16, matrix_image_spirv,
+   matrix::matrix_type::sint8, matrix::matrix_type::sint32>;
+
+using SpirvCpuFp16Case = MatrixCase<sycl::half, sycl::half, float, 16, 16,
+   32, 16, matrix_image_spirv,
+   matrix::matrix_type::fp16, matrix::matrix_type::fp32>;
+using SpirvCpuBf16Case = MatrixCase<sycl::ext::oneapi::bfloat16,
+   sycl::ext::oneapi::bfloat16, float, 16, 16, 32, 16,
+   matrix_image_spirv,
+   matrix::matrix_type::bf16, matrix::matrix_type::fp32>;
+using SpirvCpuTf32Case = MatrixCase<float, matrix::precision::tf32, float,
+   16, 16, 16, 16, matrix_image_spirv,
+   matrix::matrix_type::tf32, matrix::matrix_type::fp32>;
+using SpirvCpuInt8Case = MatrixCase<std::int8_t, std::int8_t, std::int32_t,
+   16, 16, 64, 16, matrix_image_spirv,
+   matrix::matrix_type::sint8, matrix::matrix_type::sint32>;
+
+constexpr unsigned current_matrix_image =
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+#if SYCL_BENCH_COMPILED_CUDA_SM >= 80
+   matrix_image_cuda_sm80;
+#elif SYCL_BENCH_COMPILED_CUDA_SM >= 72
+   matrix_image_cuda_sm72;
 #else
-   false;
+   matrix_image_cuda_sm70;
 #endif
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__) &&              \
+   (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__))
+   matrix_image_amd_gfx11;
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__) &&              \
+   defined(__gfx90a__)
+   matrix_image_amd_gfx90a;
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+   0;
+#else
+   matrix_image_spirv;
+#endif
+
+template <typename Case>
+inline constexpr bool matrix_case_supported_in_image =
+   (Case::images & current_matrix_image) != 0;
 
 bool matrix_dimension_supported(
    std::size_t requested, std::size_t exact, std::size_t maximum) {
@@ -401,11 +491,77 @@ double matrix_reference(
    return static_cast<double>(result);
 }
 
+unsigned matrix_image_for_device(const sycl::device &device) {
+   const auto backend = device.get_backend();
+   if (backend == sycl::backend::ext_oneapi_cuda) {
+      const std::string version =
+         device.get_info<sycl::info::device::version>();
+      try {
+         const std::size_t dot = version.find('.');
+         const int major = std::stoi(version.substr(0, dot));
+         const int minor = dot == std::string::npos
+            ? 0 : std::stoi(version.substr(dot + 1));
+         int compute_capability = major * 10 + minor;
+#ifdef SYCL_BENCH_COMPILED_CUDA_SM
+         compute_capability = std::min(
+            compute_capability, SYCL_BENCH_COMPILED_CUDA_SM);
+#else
+         return 0;
+#endif
+         if (compute_capability >= 80) {
+            return matrix_image_cuda_sm80;
+         }
+         if (compute_capability >= 72) {
+            return matrix_image_cuda_sm72;
+         }
+         if (compute_capability >= 70) {
+            return matrix_image_cuda_sm70;
+         }
+      } catch (const std::exception &) {
+      }
+      return 0;
+   }
+   if (backend == sycl::backend::ext_oneapi_hip) {
+      const std::string version =
+         device.get_info<sycl::info::device::version>();
+      if (version.rfind("gfx90a", 0) == 0) {
+#ifdef SYCL_BENCH_COMPILED_AMD_GFX90A
+         return matrix_image_amd_gfx90a;
+#else
+         return 0;
+#endif
+      }
+      if (version.rfind("gfx1100", 0) == 0 ||
+          version.rfind("gfx1101", 0) == 0 ||
+          version.rfind("gfx1102", 0) == 0) {
+#ifdef SYCL_BENCH_COMPILED_AMD_GFX11
+         return matrix_image_amd_gfx11;
+#else
+         return 0;
+#endif
+      }
+      return 0;
+   }
+   if (backend == sycl::backend::opencl ||
+       backend == sycl::backend::ext_oneapi_level_zero) {
+#ifdef SYCL_BENCH_COMPILED_SPIRV
+      return matrix_image_spirv;
+#else
+      return 0;
+#endif
+   }
+   return 0;
+}
+
 template <typename Case>
 bool supports_matrix_gemm(const sycl::device &device) {
+   if ((Case::images & matrix_image_for_device(device)) == 0) {
+      return false;
+   }
    const auto subgroup_sizes =
       device.get_info<sycl::info::device::sub_group_sizes>();
-   if (std::find(subgroup_sizes.begin(), subgroup_sizes.end(), 32) ==
+   if (std::find(subgroup_sizes.begin(), subgroup_sizes.end(),
+          Case::subgroup) ==
        subgroup_sizes.end()) {
       return false;
    }
@@ -440,20 +596,20 @@ sycl::event launch_matrix_gemm(sycl::queue &q,
    std::size_t size) {
    using Element = typename Case::element_type;
    using Acc = typename Case::acc_type;
-   constexpr std::size_t subgroup = 32;
    return q.parallel_for<MatrixGemmKernel<Case>>(
       sycl::nd_range<2>({size / (Case::m * Case::rows),
-                         size / (Case::n * Case::cols) * subgroup},
-                        {1, subgroup}),
+                         size / (Case::n * Case::cols) * Case::subgroup},
+                        {1, Case::subgroup}),
       [=](sycl::nd_item<2> item)
-#if !defined(__SYCL_DEVICE_ONLY__) || !defined(__AMDGCN__)
-         [[sycl::reqd_sub_group_size(32)]]
+#if !defined(__SYCL_DEVICE_ONLY__) ||                                    \
+   (!defined(__NVPTX__) && !defined(__AMDGCN__))
+         [[sycl::reqd_sub_group_size(Case::subgroup)]]
 #endif
       {
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
-         if constexpr (!amd_matrix_case_supported_in_image<Case>) {
-            // Unsupported AMD matrix cases remain placeholders so one fat
-            // binary can still contain CUDA, SPIR-V and AMD images.
+#if defined(__SYCL_DEVICE_ONLY__)
+         if constexpr (!matrix_case_supported_in_image<Case>) {
+            // Backend-specific unsupported cases remain placeholders so one
+            // fat binary can contain CUDA, SPIR-V and AMD images.
             (void)item;
             (void)a;
             (void)b;
@@ -577,7 +733,6 @@ double matrix_issue_rate(sycl::queue &q, const sycl::device &device) {
    using Storage = typename Case::storage_type;
    using Element = typename Case::element_type;
    using Acc = typename Case::acc_type;
-   constexpr std::size_t subgroup = 32;
    constexpr std::size_t accumulators = 4;
    const std::size_t groups = std::max<std::size_t>(256,
       16 * device.get_info<sycl::info::device::max_compute_units>());
@@ -601,16 +756,18 @@ double matrix_issue_rate(sycl::queue &q, const sycl::device &device) {
       const auto *pb_raw = b.get();
       auto *out_raw = output.get();
       return iq.parallel_for<MatrixIssueKernel<Case>>(
-         sycl::nd_range<1>(groups * subgroup, subgroup),
+         sycl::nd_range<1>(
+            groups * Case::subgroup, Case::subgroup),
          [=](sycl::nd_item<1> item)
-#if !defined(__SYCL_DEVICE_ONLY__) || !defined(__AMDGCN__)
-            [[sycl::reqd_sub_group_size(32)]]
+#if !defined(__SYCL_DEVICE_ONLY__) ||                                    \
+   (!defined(__NVPTX__) && !defined(__AMDGCN__))
+            [[sycl::reqd_sub_group_size(Case::subgroup)]]
 #endif
          {
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
-            if constexpr (!amd_matrix_case_supported_in_image<Case>) {
-               // See launch_matrix_gemm: unsupported AMD matrix images retain
-               // a placeholder kernel.
+#if defined(__SYCL_DEVICE_ONLY__)
+            if constexpr (!matrix_case_supported_in_image<Case>) {
+               // See launch_matrix_gemm: unsupported backend matrix images
+               // retain a placeholder kernel.
                (void)item;
                (void)iterations;
                (void)pa_raw;
@@ -713,7 +870,10 @@ std::vector<BenchmarkMeasurement> benchmark_matrix_case(sycl::queue &q,
       result.value = rate.tops;
       result.unit = unit;
       result.detail = std::to_string(rate.size) + " x " +
-         std::to_string(rate.size) + " x " + std::to_string(rate.size);
+         std::to_string(rate.size) + " x " + std::to_string(rate.size) +
+         "; tile " + std::to_string(Case::m) + " x " +
+         std::to_string(Case::n) + " x " + std::to_string(Case::k) +
+         "; subgroup " + std::to_string(Case::subgroup);
       results.push_back(std::move(result));
    } catch (const std::exception &e) {
       BenchmarkMeasurement result{"matrix", name};
@@ -748,6 +908,26 @@ void append_matrix_case(std::vector<BenchmarkMeasurement> &measurements,
    measurements.insert(measurements.end(),
       std::make_move_iterator(results.begin()),
       std::make_move_iterator(results.end()));
+}
+
+template <typename First, typename... Rest>
+void append_matrix_variants(std::vector<BenchmarkMeasurement> &measurements,
+   sycl::queue &q, const sycl::device &device, const char *name) {
+   if (supports_matrix_gemm<First>(device)) {
+      append_matrix_case<First>(measurements, q, device, name);
+   } else if constexpr (sizeof...(Rest) != 0) {
+      append_matrix_variants<Rest...>(measurements, q, device, name);
+   } else {
+      BenchmarkMeasurement result{"matrix", name};
+      result.status = "unavailable";
+      result.message = "unsupported by device or compiled image";
+      measurements.push_back(std::move(result));
+   }
+}
+
+template <typename... Cases>
+bool supports_any_matrix_variant(const sycl::device &device) {
+   return (supports_matrix_gemm<Cases>(device) || ...);
 }
 
 struct MemoryRates {
@@ -882,6 +1062,7 @@ enum class StressComputeWorkload {
    fp32,
    fp64,
    matrix_fp16,
+   matrix_bf16,
    matrix_tf32,
    matrix_int8,
    matrix_fp64
@@ -927,6 +1108,8 @@ const char *stress_compute_workload_name(StressComputeWorkload workload) {
       return "fp64";
    case StressComputeWorkload::matrix_fp16:
       return "matrix-fp16";
+   case StressComputeWorkload::matrix_bf16:
+      return "matrix-bf16";
    case StressComputeWorkload::matrix_tf32:
       return "matrix-tf32";
    case StressComputeWorkload::matrix_int8:
@@ -1192,7 +1375,6 @@ public:
    }
 
 private:
-   static constexpr std::size_t subgroup = 32;
    static constexpr std::size_t accumulators = 4;
 
    static Storage matrix_input() {
@@ -1212,14 +1394,16 @@ private:
       const Storage *pb_raw = b_.get();
       Acc *out_raw = output_.get();
       return q_.parallel_for<StressMatrixKernel<Case>>(
-         sycl::nd_range<1>(groups_ * subgroup, subgroup),
+         sycl::nd_range<1>(
+            groups_ * Case::subgroup, Case::subgroup),
          [=](sycl::nd_item<1> item)
-#if !defined(__SYCL_DEVICE_ONLY__) || !defined(__AMDGCN__)
-            [[sycl::reqd_sub_group_size(32)]]
+#if !defined(__SYCL_DEVICE_ONLY__) ||                                    \
+   (!defined(__NVPTX__) && !defined(__AMDGCN__))
+            [[sycl::reqd_sub_group_size(Case::subgroup)]]
 #endif
          {
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
-            if constexpr (!amd_matrix_case_supported_in_image<Case>) {
+#if defined(__SYCL_DEVICE_ONLY__)
+            if constexpr (!matrix_case_supported_in_image<Case>) {
                (void)item;
                (void)iterations;
                (void)pa_raw;
@@ -1296,6 +1480,23 @@ std::unique_ptr<StressComputeRunner> make_stress_matrix_compute(
    return result;
 }
 
+template <typename First, typename... Rest>
+std::unique_ptr<StressComputeRunner> make_stress_matrix_variants(
+   sycl::queue &q, const sycl::device &device, bool profiling,
+   StressComputeWorkload workload) {
+   if (supports_matrix_gemm<First>(device)) {
+      return make_stress_matrix_compute<First>(
+         q, device, profiling, workload);
+   }
+   if constexpr (sizeof...(Rest) != 0) {
+      return make_stress_matrix_variants<Rest...>(
+         q, device, profiling, workload);
+   }
+   throw std::runtime_error(std::string("compute workload ") +
+      stress_compute_workload_name(workload) +
+      " is not supported by device or compiled image");
+}
+
 std::unique_ptr<StressComputeRunner> make_stress_compute(
    sycl::queue &q, const sycl::device &device, bool profiling,
    StressComputeWorkload workload) {
@@ -1311,16 +1512,22 @@ std::unique_ptr<StressComputeRunner> make_stress_compute(
       return std::make_unique<StressScalarCompute<double>>(
          q, device, profiling);
    case StressComputeWorkload::matrix_fp16:
-      return make_stress_matrix_compute<Fp16Case>(
-         q, device, profiling, workload);
+      return make_stress_matrix_variants<SpirvFp16WideCase,
+         SpirvFp16NarrowCase, SpirvCpuFp16Case, Fp16Case,
+         Amd90aFp16Case>(q, device, profiling, workload);
+   case StressComputeWorkload::matrix_bf16:
+      return make_stress_matrix_variants<SpirvBf16WideCase,
+         SpirvBf16NarrowCase, SpirvCpuBf16Case, Bf16Case,
+         Amd90aBf16Case>(q, device, profiling, workload);
    case StressComputeWorkload::matrix_tf32:
-      return make_stress_matrix_compute<Tf32Case>(
-         q, device, profiling, workload);
+      return make_stress_matrix_variants<SpirvTf32WideCase,
+         SpirvCpuTf32Case, Tf32Case>(q, device, profiling, workload);
    case StressComputeWorkload::matrix_int8:
-      return make_stress_matrix_compute<Int8Case>(
-         q, device, profiling, workload);
+      return make_stress_matrix_variants<SpirvInt8WideCase,
+         SpirvInt8NarrowCase, SpirvCpuInt8Case, Int8Case,
+         Amd90aInt8Case>(q, device, profiling, workload);
    case StressComputeWorkload::matrix_fp64:
-      return make_stress_matrix_compute<Fp64Case>(
+      return make_stress_matrix_variants<Fp64Case, Amd90aFp64Case>(
          q, device, profiling, workload);
    }
    throw std::runtime_error("unknown stress compute workload");
@@ -1934,6 +2141,9 @@ StressComputeWorkload parse_stress_compute_workload(
    if (value == "matrix-fp16") {
       return StressComputeWorkload::matrix_fp16;
    }
+   if (value == "matrix-bf16") {
+      return StressComputeWorkload::matrix_bf16;
+   }
    if (value == "matrix-tf32") {
       return StressComputeWorkload::matrix_tf32;
    }
@@ -1944,8 +2154,8 @@ StressComputeWorkload parse_stress_compute_workload(
       return StressComputeWorkload::matrix_fp64;
    }
    throw std::invalid_argument("invalid compute workload: " + value +
-      "; expected fp32, fp64, matrix-fp16, matrix-tf32, matrix-int8, "
-      "or matrix-fp64");
+      "; expected fp32, fp64, matrix-fp16, matrix-bf16, matrix-tf32, "
+      "matrix-int8, or matrix-fp64");
 }
 
 unsigned parse_memory_percent(std::string value) {
@@ -2157,10 +2367,13 @@ std::vector<DeviceEntry> select_devices(
 }
 
 bool matrix_capable(const sycl::device &device) {
-   return supports_matrix_gemm<Fp16Case>(device) ||
-      supports_matrix_gemm<Tf32Case>(device) ||
-      supports_matrix_gemm<Int8Case>(device) ||
-      supports_matrix_gemm<Fp64Case>(device);
+   return supports_any_matrix_variant<SpirvFp16WideCase,
+      SpirvFp16NarrowCase, SpirvCpuFp16Case, SpirvBf16WideCase,
+      SpirvBf16NarrowCase, SpirvCpuBf16Case, SpirvTf32WideCase,
+      SpirvCpuTf32Case, SpirvInt8WideCase, SpirvInt8NarrowCase,
+      SpirvCpuInt8Case, Fp16Case, Bf16Case, Tf32Case, Int8Case,
+      Fp64Case, Amd90aFp16Case, Amd90aBf16Case, Amd90aInt8Case,
+      Amd90aFp64Case>(device);
 }
 
 void write_device_json(std::ostream &out, const DeviceEntry &entry) {
@@ -2254,8 +2467,8 @@ void render_devices(const std::vector<DeviceEntry> &devices,
 }
 
 const std::set<std::string> all_benchmark_tests{
-   "fp64", "fp32", "matrix-fp16", "matrix-tf32", "matrix-int8",
-   "matrix-fp64", "memory", "transfer"};
+   "fp64", "fp32", "matrix-fp16", "matrix-bf16", "matrix-tf32",
+   "matrix-int8", "matrix-fp64", "memory", "transfer"};
 
 std::set<std::string> parse_tests(const std::string &value) {
    if (value == "all") {
@@ -2319,19 +2532,26 @@ BenchmarkReport run_benchmark(const DeviceEntry &entry,
          benchmark_compute<float>(q, device, "FP32"));
    }
    if (test_enabled(options.tests, "matrix-fp16")) {
-      append_matrix_case<Fp16Case>(
+      append_matrix_variants<SpirvFp16WideCase, SpirvFp16NarrowCase,
+         SpirvCpuFp16Case, Fp16Case, Amd90aFp16Case>(
          report.measurements, q, device, "FP16->FP32");
    }
+   if (test_enabled(options.tests, "matrix-bf16")) {
+      append_matrix_variants<SpirvBf16WideCase, SpirvBf16NarrowCase,
+         SpirvCpuBf16Case, Bf16Case, Amd90aBf16Case>(
+         report.measurements, q, device, "BF16->FP32");
+   }
    if (test_enabled(options.tests, "matrix-tf32")) {
-      append_matrix_case<Tf32Case>(
-         report.measurements, q, device, "TF32->FP32");
+      append_matrix_variants<SpirvTf32WideCase, SpirvCpuTf32Case,
+         Tf32Case>(report.measurements, q, device, "TF32->FP32");
    }
    if (test_enabled(options.tests, "matrix-int8")) {
-      append_matrix_case<Int8Case>(
+      append_matrix_variants<SpirvInt8WideCase, SpirvInt8NarrowCase,
+         SpirvCpuInt8Case, Int8Case, Amd90aInt8Case>(
          report.measurements, q, device, "INT8->INT32");
    }
    if (test_enabled(options.tests, "matrix-fp64")) {
-      append_matrix_case<Fp64Case>(
+      append_matrix_variants<Fp64Case, Amd90aFp64Case>(
          report.measurements, q, device, "FP64->FP64");
    }
    if (test_enabled(options.tests, "memory")) {
@@ -2819,8 +3039,8 @@ void show_benchmark_help(const char *program) {
       << "  --tests LIST       comma-separated tests (default: all)\n"
       << "  --format FORMAT    text, json, jsonl, or csv\n"
       << "  --output FILE      write output to FILE; '-' means stdout\n\n"
-      << "Tests: fp64, fp32, matrix-fp16, matrix-tf32, matrix-int8,\n"
-      << "       matrix-fp64, memory, transfer\n";
+      << "Tests: fp64, fp32, matrix-fp16, matrix-bf16, matrix-tf32,\n"
+      << "       matrix-int8, matrix-fp64, memory, transfer\n";
 }
 
 void show_stress_help(const char *program) {
@@ -2832,8 +3052,9 @@ void show_stress_help(const char *program) {
       << "  --device SELECTOR      global ID, backend:index, or unique name text\n"
       << "  --all-gpus             select every visible GPU\n"
       << "  --profile PROFILE      compute, vram, or mixed (default: mixed)\n"
-      << "  --compute-workload W   fp32, fp64, matrix-fp16, matrix-tf32,\n"
-      << "                         matrix-int8, or matrix-fp64 (default: fp32)\n"
+      << "  --compute-workload W   fp32, fp64, matrix-fp16, matrix-bf16,\n"
+      << "                         matrix-tf32, matrix-int8, or matrix-fp64\n"
+      << "                         (default: fp32)\n"
       << "  --memory PERCENT       device memory to validate, 1-90 (default: 50)\n"
       << "  --chunk-size SIZE      maximum allocation chunk in MiB or GiB\n"
       << "                         (default: 512MiB; bare numbers mean MiB)\n"

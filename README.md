@@ -29,14 +29,14 @@ cannot load every visible device.
 The benchmark command measures:
 
 - FP32 and, when supported, FP64 fused multiply-add throughput
-- FP16, TF32, INT8, and FP64 joint-matrix throughput
+- FP16, BF16, TF32, INT8, and FP64 joint-matrix throughput
 - Device-memory read and write bandwidth
 - Host-to-device, device-to-host, and concurrent USM transfer bandwidth
 
 The stress command provides:
 
 - `compute`, `vram`, and `mixed` profiles
-- Selectable FP32, FP64, FP16/TF32/INT8/FP64 joint-matrix compute workloads
+- Selectable FP32, FP64, FP16/BF16/TF32/INT8/FP64 joint-matrix compute workloads
 - Full compute-output validation after every batch
 - Full working-set validation after each address-dependent VRAM pattern write
 - Bounded durations, reproducible seeds, and graceful Ctrl-C handling
@@ -50,7 +50,9 @@ The stress command provides:
 - Host USM support for transfer measurements
 - CUDA and a compatible NVIDIA driver for CUDA builds
 - ROCm and a compatible AMD GPU for HIP builds
-- A 32-lane subgroup and matching `matrix_combinations` entry for matrix tests
+- A compiled matrix image, a matching `matrix_combinations` entry, and the
+  required subgroup (16 lanes for SPIR-V matrix variants, 32 for CUDA/gfx11,
+  or 64 for gfx90a)
 
 To reproduce the architecture-specific matrix results, use the custom
 [lilohuang/llvm commit `01516f0d8a96b135c3ce45405adbaf2f3a7cd336`](https://github.com/lilohuang/llvm/commit/01516f0d8a96b135c3ce45405adbaf2f3a7cd336).
@@ -96,11 +98,17 @@ make cuda
 make hip
 make spirv
 make all
+make smoke
 ```
 
-AMD's signed-character libspirv compatibility alias is created inside a
-configuration-specific `build/clang-resource-*` directory; the build no longer
-modifies the compiler installation.
+`make smoke` benchmarks every visible matrix-capable device and runs a short
+BF16 compute stress test wherever that workload is supported.
+
+AMD's signed-character libspirv compatibility overlay is created inside a
+configuration-specific `build/clang-resource-*` directory. The selected
+bitcode is copied with its target triple normalized to `amdgcn-amd-amdhsa`;
+the build never modifies the compiler installation. The overlay is regenerated
+when the compiler identity or source bitcode changes.
 Override the bitcode location when necessary:
 
 ```sh
@@ -146,13 +154,13 @@ Select a subset with a comma-separated list:
 ```sh
 ./sycl-bench benchmark --device hip:0 --tests fp32,memory
 ./sycl-bench benchmark --device cuda:0 \
-  --tests matrix-fp16,matrix-tf32,matrix-int8
+  --tests matrix-fp16,matrix-bf16,matrix-tf32,matrix-int8
 ```
 
 Available tests are:
 
 ```text
-fp64, fp32, matrix-fp16, matrix-tf32, matrix-int8,
+fp64, fp32, matrix-fp16, matrix-bf16, matrix-tf32, matrix-int8,
 matrix-fp64, memory, transfer
 ```
 
@@ -161,7 +169,14 @@ event profiling is used when available, with host timing as a fallback. FMA is
 counted as two operations. Unsupported tests are reported as `unavailable`.
 
 Matrix output contains complete GEMM throughput and an `.issue` measurement.
-The latter is an instruction issue-rate ceiling, not complete GEMM throughput.
+The latter is an instruction issue-rate ceiling and is the primary metric for
+comparing each platform's highest native joint-matrix throughput. Each GEMM
+result records the selected tile dimensions and subgroup size.
+
+The executable records the matrix profile compiled into each device image and
+intersects it with the selected device's runtime capabilities. It chooses a
+matching tile variant for SPIR-V devices, CUDA compute capabilities, gfx11, or
+gfx90a; a placeholder kernel is never selected for execution.
 
 All matrix tests measure dense MMA throughput through the ordinary
 `joint_matrix_mad` path. Compare a reported rate only with a dense MMA peak
@@ -184,6 +199,8 @@ A duration and explicit device selection are required:
   --compute-workload fp64
 ./sycl-bench stress --device level_zero:0 --duration 30m --profile compute \
   --compute-workload matrix-fp16
+./sycl-bench stress --device level_zero:0 --duration 30m --profile compute \
+  --compute-workload matrix-bf16
 ./sycl-bench stress --device hip:0 --duration 8h \
   --profile vram --memory 80
 ```
@@ -196,11 +213,13 @@ seed=0x6d2b79f5  execution=parallel
 ```
 
 The default compute workload is `fp32`. `--compute-workload` also accepts
-`fp64`, `matrix-fp16`, `matrix-tf32`, `matrix-int8`, and `matrix-fp64` for the
-`compute` and `mixed` profiles. A requested FP64 or joint-matrix workload is
+`fp64`, `matrix-fp16`, `matrix-bf16`, `matrix-tf32`, `matrix-int8`, and
+`matrix-fp64` for the `compute` and `mixed` profiles. A requested FP64 or
+joint-matrix workload is
 never replaced with FP32: if the selected device does not advertise the
-required FP64 aspect, 32-lane subgroup, or matching `matrix_combinations`
-entry, that device reports `error` and the command exits with status 1. Matrix
+required FP64 aspect, compiled image, subgroup, or matching
+`matrix_combinations` entry, that device reports `error` and the command exits
+with status 1. Matrix
 workloads use the same dense matrix path described above and perform a full
 output verification after every timed batch.
 
